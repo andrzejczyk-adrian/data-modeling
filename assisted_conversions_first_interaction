@@ -1,0 +1,92 @@
+CREATE OR REPLACE TEMP TABLE
+  conversions AS (
+  SELECT
+    user_pseudo_id, 
+    ga_session_id, 
+    CONCAT(user_pseudo_id, '_', ga_session_id) AS session_id, 
+    CONCAT(user_pseudo_id, '_',  ga_session_id, '_', event_timestamp) AS conversion_id,
+    DATETIME(TIMESTAMP_MICROS(event_timestamp), 'Europe/Warsaw') AS conversion_date_time,
+    DATETIME(TIMESTAMP_MICROS(lag(event_timestamp) over(partition by user_pseudo_id order by event_timestamp)), 'Europe/Warsaw') as prev_conv_datetime,
+    ecommerce.purchase_revenue as revenue
+  FROM
+    `triverna-datawarehouse.ga4_transformed.events_transformed`
+  WHERE
+    user_pseudo_id IS NOT NULL
+    AND ga_session_id IS NOT NULL
+    AND length(user_pseudo_id)<=21
+    AND event_name='purchase'
+  order by user_pseudo_id, conversion_date_time);
+
+CREATE OR REPLACE TEMP TABLE
+  touchpoints AS (
+  SELECT
+    user_pseudo_id,
+    ga_session_id,
+    CONCAT(user_pseudo_id, '_', ga_session_id) AS session_id,
+    DATETIME(TIMESTAMP_MICROS(FIRST_VALUE(event_timestamp) OVER( PARTITION BY CONCAT(user_pseudo_id, '_', ga_session_id) ORDER BY event_timestamp )), 'Europe/Warsaw') AS session_start,
+    event_name,
+    CASE WHEN event_name='purchase' THEN 'CONVERSION' END AS is_conversion,
+    DATETIME(TIMESTAMP_MICROS(event_timestamp), 'Europe/Warsaw') AS event_date_time,
+    event_timestamp,
+    page_location 
+  FROM
+    `triverna-datawarehouse.ga4_transformed.events_transformed`
+  WHERE
+    user_pseudo_id IN (SELECT DISTINCT user_pseudo_id FROM conversions)
+    AND ga_session_id IS NOT NULL
+  ORDER BY
+    user_pseudo_id,
+    session_id,
+    event_date_time);
+
+CREATE OR REPLACE TEMP TABLE conversions_with_touchpoints as(
+  SELECT 
+    c.user_pseudo_id,
+    c.ga_session_id as conv_ga_session_id,
+    c.session_id as conv_session_id,
+    c.conversion_date_time as conv_date_time,
+    c.conversion_id,
+    c.revenue,
+    t.session_id as touch_session_id,
+    t.session_start as touch_session_start,
+    t.event_name as touch_event_name,
+    t.event_date_time as touch_date_time,
+    t.page_location
+  FROM conversions c
+  INNER JOIN touchpoints t
+    ON c.user_pseudo_id=t.user_pseudo_id 
+      AND DATE(t.session_start) >=DATE_SUB(DATE(c.conversion_date_time), INTERVAL 30 day) 
+      AND t.session_start<=c.conversion_date_time
+      AND c.conversion_date_time>=t.event_date_time
+      AND (c.prev_conv_datetime is null or c.prev_conv_datetime<=t.event_date_time)
+      AND t.event_name !='purchase'
+  );
+
+CREATE OR REPLACE TABLE assisted_conversions.assisted_conversions_first_interaction AS
+SELECT date, first_page_location AS page_location, COUNT(conversion_id) conversions, SUM(revenue) revenue
+  FROM(
+    SELECT DISTINCT DATE(conv_date_time) AS date, first_page_location, conversion_id, revenue
+    FROM(
+      SELECT 
+        conversion_id, 
+        revenue,
+        conv_date_time, 
+        FIRST_VALUE(page_location) OVER(PARTITION BY conversion_id ORDER BY touch_date_time ASC) first_page_location
+      FROM conversions_with_touchpoints
+      WHERE page_location LIKE 'https://triverna.pl/blog/%')
+    )
+GROUP BY date, page_location
+ORDER BY date ASC;
+
+CREATE OR REPLACE TABLE assisted_conversions.assisted_conversions AS
+SELECT date, page_location, SUM(conv) conversions, SUM(rev) revenue FROM (
+  SELECT page_location, date, revenue/cnt as rev, 1/cnt as conv
+    FROM (
+      select conversion_id, revenue, page_location, DATE,
+      count(*) OVER(PARTITION BY conversion_id) cnt
+      FROM(
+        SELECT DISTINCT conversion_id, revenue, page_location, DATE(conv_date_time) AS DATE
+        FROM conversions_with_touchpoints
+        WHERE page_location LIKE 'https://triverna.pl/blog/%')
+      ORDER BY conversion_id))
+GROUP BY page_location, date;
